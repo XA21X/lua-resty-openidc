@@ -292,6 +292,22 @@ local function decorate_request(http_request_decorator, req)
   return http_request_decorator and http_request_decorator(req) or req
 end
 
+local function get_absolute_uri(relative_uri)
+  -- ensure uri starts with /
+  if relative_uri:sub(1, 1) ~= "/" then
+    relative_uri = "/" .. relative_uri
+  end
+
+  local scheme = get_scheme()
+  local host = get_host_name()
+
+  if not host then
+    return relative_uri -- fallback
+  end
+
+  return scheme .. "://" .. host .. relative_uri
+end
+
 -- send the browser of to the OP's authorization endpoint
 local function openidc_authorize(opts, session, target_url, prompt)
   local resty_random = require("resty.random")
@@ -329,7 +345,7 @@ local function openidc_authorize(opts, session, target_url, prompt)
   end
 
   -- store state in the session
-  session.data.original_url = target_url
+  session.data.original_url = get_absolute_uri(target_url)
   session.data.state = state
   session.data.nonce = nonce
   session.data.last_authenticated = ngx.time()
@@ -984,13 +1000,26 @@ local function openidc_load_and_validate_jwt_id_token(opts, jwt_id_token, sessio
   return id_token
 end
 
+local function get_uri()
+  return get_forwarded_parameter('uri')
+    or get_first_header_and_strip_whitespace('X-Forwarded-URI')
+    or ngx.req.request_uri
+end
+
+-- like ngx.req.get_uri_args, with X-/Forwarded support
+local function get_uri_args()
+  -- NOTE: may be more efficient if we use ngx.req.get_uri_args if get_url returns ngx.req.request_uri?
+  local uri_args = get_uri():match("^[^?]+?(.*)$")
+  return uri_args and ngx.decode_args(uri_args)
+end
+
 -- handle a "code" authorization response from the OP
 local function openidc_authorization_response(opts, session)
-  local args = ngx.req.get_uri_args()
+  local args = get_uri_args()
   local err
 
   if not args.code or not args.state then
-    err = "unhandled request to the redirect_uri: " .. ngx.var.request_uri
+    err = "unhandled request to the redirect_uri: " .. get_uri()
     log(ERROR, err)
     return nil, err, session.data.original_url, session
   end
@@ -1287,7 +1316,7 @@ function openidc.authenticate(opts, target_url, unauth_action, session_opts)
 
   local session = r_session.start(session_opts)
 
-  target_url = target_url or ngx.var.request_uri
+  target_url = target_url or get_uri()
 
   local access_token
 
