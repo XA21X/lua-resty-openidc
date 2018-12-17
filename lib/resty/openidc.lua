@@ -68,7 +68,9 @@ local WARN = ngx.WARN
 
 local supported_token_auth_methods = {
   client_secret_basic = true,
-  client_secret_post = true
+  client_secret_post = true,
+  private_key_jwt = true,
+  client_secret_jwt = true
 }
 
 local openidc = {
@@ -421,13 +423,40 @@ function openidc.call_token_endpoint(opts, endpoint, body, auth, endpoint_name, 
         headers.Authorization = "Basic " .. b64(ngx.escape_uri(opts.client_id) .. ":")
       end
       log(DEBUG, "client_secret_basic: authorization header '" .. headers.Authorization .. "'")
-    end
-    if auth == "client_secret_post" then
+
+    elseif auth == "client_secret_post" then
       body.client_id = opts.client_id
       if opts.client_secret then
         body.client_secret = opts.client_secret
       end
       log(DEBUG, "client_secret_post: client_id and client_secret being sent in POST body")
+
+    elseif auth == "private_key_jwt" or auth == "client_secret_jwt" then
+      body.client_id = opts.client_id
+      body.client_assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+      local now = ngx.time()
+      local assertion = {
+        header = {
+          typ = "JWT",
+          alg = auth == "private_key_jwt" and "RS256" or "HS256",
+        },
+        payload = {
+          iss = opts.client_id,
+          sub = opts.client_id,
+          aud = endpoint,
+          jti = ngx.var.request_id,
+          exp = now + (opts.client_jwt_assertion_expires_in and opts.client_jwt_assertion_expires_in or 60),
+          iat = now
+        }
+      }
+      if auth == "private_key_jwt" then
+        assertion.header.kid = opts.client_rsa_private_key_id
+      end
+
+      local r_jwt = require("resty.jwt")
+      body.client_assertion = r_jwt:sign(auth == "private_key_jwt" and opts.client_rsa_private_key or opts.client_secret,
+                                         assertion)
+      log(DEBUG, auth .. ": client_id, client_assertion_type and client_assertion being sent in POST body")
     end
   end
 
@@ -542,13 +571,7 @@ local function openidc_discover(url, ssl_verify, timeout, exptime, proxy_opts, h
       log(DEBUG, "response data: " .. res.body)
       json, err = openidc_parse_json_response(res)
       if json then
-        if string.sub(url, 1, string.len(json['issuer'])) == json['issuer'] then
-          openidc_cache_set("discovery", url, cjson.encode(json), exptime or 24 * 60 * 60)
-        else
-          err = "issuer field in Discovery data does not match URL"
-          log(ERROR, err)
-          json = nil
-        end
+        openidc_cache_set("discovery", url, cjson.encode(json), exptime or 24 * 60 * 60)
       else
         err = "could not decode JSON from Discovery data" .. (err and (": " .. err) or '')
         log(ERROR, err)
@@ -880,7 +903,7 @@ end
 -- parse a JWT and verify its signature (if present)
 local function openidc_load_jwt_and_verify_crypto(opts, jwt_string, asymmetric_secret,
 symmetric_secret, expected_algs, ...)
-  local jwt = require("resty.jwt")
+  local r_jwt = require("resty.jwt")
   local enc_hdr, enc_payload, enc_sign = string.match(jwt_string, '^(.+)%.(.+)%.(.*)$')
   if enc_payload and (not enc_sign or enc_sign == "") then
     local jwt = openidc_load_jwt_none_alg(enc_hdr, enc_payload)
@@ -894,7 +917,7 @@ symmetric_secret, expected_algs, ...)
     end -- otherwise the JWT is invalid and load_jwt produces an error
   end
 
-  local jwt_obj = jwt:load_jwt(jwt_string, nil)
+  local jwt_obj = r_jwt:load_jwt(jwt_string, nil)
   if not jwt_obj.valid then
     local reason = "invalid jwt"
     if jwt_obj.reason then
@@ -942,7 +965,7 @@ symmetric_secret, expected_algs, ...)
     jwt_validators.set_system_leeway(opts.iat_slack and opts.iat_slack or 120)
   end
 
-  jwt_obj = jwt:verify_jwt_obj(secret, jwt_obj, ...)
+  jwt_obj = r_jwt:verify_jwt_obj(secret, jwt_obj, ...)
   if jwt_obj then
     log(DEBUG, "jwt: ", cjson.encode(jwt_obj), " ,valid: ", jwt_obj.valid, ", verified: ", jwt_obj.verified)
   end
@@ -1031,6 +1054,11 @@ local function openidc_authorization_response(opts, session)
     return nil, err, session.data.original_url, session
   end
 
+  err = ensure_config(opts)
+  if err then
+    return nil, err, session.data.original_url, session
+  end
+
   -- check the iss if returned from the OP
   if args.iss and args.iss ~= opts.discovery.issuer then
     err = "iss from argument: " .. args.iss .. " does not match expected issuer: " .. opts.discovery.issuer
@@ -1042,11 +1070,6 @@ local function openidc_authorization_response(opts, session)
   if args.client_id and args.client_id ~= opts.client_id then
     err = "client_id from argument: " .. args.client_id .. " does not match expected client_id: " .. opts.client_id
     log(ERROR, err)
-    return nil, err, session.data.original_url, session
-  end
-
-  err = ensure_config(opts)
-  if err then
     return nil, err, session.data.original_url, session
   end
 
@@ -1287,7 +1310,7 @@ local function openidc_access_token(opts, session, try_to_renew)
 
   -- save the session with the new access_token and optionally the new refresh_token and id_token using a new sessionid
   local regenerated
-  regerenerated, err = session:regenerate()
+  regenerated, err = session:regenerate()
   if err then
     log(ERROR, "failed to regenerate session: " .. err)
     return nil, err
@@ -1445,7 +1468,7 @@ local function openidc_get_bearer_access_token_from_cookie(opts)
 
   local accept_token_as = opts.auth_accept_token_as or "header"
   if accept_token_as:find("cookie") ~= 1 then
-    return nul, "openidc_get_bearer_access_token_from_cookie called but auth_accept_token_as wants "
+    return nil, "openidc_get_bearer_access_token_from_cookie called but auth_accept_token_as wants "
         .. opts.auth_accept_token_as
   end
   local divider = accept_token_as:find(':')
